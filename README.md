@@ -16,6 +16,7 @@ npm test                      # движок оценок, права досту
 
 ## Рабочий сервер
 
+**Быстрый демо-стенд (Supabase + Vercel):** [docs/SUPABASE.md](docs/SUPABASE.md).
 **Пошаговая инструкция для школы (какие сайты, какие команды):** [docs/ИНСТРУКЦИЯ.md](docs/ИНСТРУКЦИЯ.md).
 **Развёртывание на сервере в РК** (Docker: сайт + PostgreSQL + HTTPS + бэкапы): [docs/DEPLOY.md](docs/DEPLOY.md).
 **Меры безопасности и что осталось сделать:** [docs/SECURITY.md](docs/SECURITY.md).

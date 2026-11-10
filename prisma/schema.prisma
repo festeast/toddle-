@@ -16,13 +16,15 @@
 
 generator client {
   provider      = "prisma-client-js"
-  // native — для разработки; debian-openssl-3.0.x — для Docker-образа (distroless/Debian 12)
-  binaryTargets = ["native", "debian-openssl-3.0.x"]
+  // native — разработка; debian-openssl-3.0.x — Docker (distroless/Debian 12); rhel-openssl-3.0.x — Vercel
+  binaryTargets = ["native", "debian-openssl-3.0.x", "rhel-openssl-3.0.x"]
 }
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
+  url       = env("DATABASE_URL")
+  /// Прямое подключение для миграций (в Supabase — session pooler, порт 5432); локально и в Docker совпадает с DATABASE_URL
+  directUrl = env("DIRECT_URL")
 }
 
 // ============================ ENUMS ==========================================

@@ -3,7 +3,8 @@ export const config = {
   isProd: process.env.NODE_ENV === "production",
   /** Демо-вход по ролям без пароля. Только для демо-стендов с вымышленными данными! */
   demoMode: process.env.DEMO_MODE === "true",
-  appUrl: (process.env.APP_URL ?? "http://localhost:3000").replace(/\/$/, ""),
+  /** Адрес сайта для ссылок-приглашений и Google. На Vercel по умолчанию берётся производственный домен проекта. */
+  appUrl: (process.env.APP_URL ?? (process.env.VERCEL_PROJECT_PRODUCTION_URL ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}` : "http://localhost:3000")).replace(/\/$/, ""),
   /** Secure-cookie: включено по умолчанию в production (сайт за HTTPS). */
   cookieSecure: process.env.COOKIE_SECURE ? process.env.COOKIE_SECURE === "true" : process.env.NODE_ENV === "production",
   sessionDays: Number(process.env.SESSION_DAYS ?? 14),
