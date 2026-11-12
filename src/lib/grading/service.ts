@@ -1,9 +1,10 @@
 import type { PrismaClient, Prisma } from "@prisma/client";
 import { randomUUID } from "node:crypto";
 import {
-  computeTermGrade, combinePeriodGrades, toDependentScale, type Aggregation, type BoundarySets,
+  combinePeriodGrades, toDependentScale, type Aggregation, type BoundarySets,
   type PercentBand, type DependentEntry,
 } from "./engine";
+import { computeStudentTerm, weightsFor, type CalcEval, type CalcPolicy, type Missed, type TermContext } from "./term";
 
 type Tx = PrismaClient | Prisma.TransactionClient;
 
@@ -32,6 +33,18 @@ export async function loadPolicy(db: Tx, programmeId: string, academicYearId: st
   return { policy, boundarySets, percentBands, fiveScale };
 }
 
+/** Параметры политики в виде, нужном чистому расчёту (term.ts). */
+export function calcPolicyOf(p: Awaited<ReturnType<typeof loadPolicy>>): CalcPolicy {
+  return {
+    aggregation: p.policy.criterionAggregation as Aggregation,
+    boundarySets: p.boundarySets,
+    percentBands: p.percentBands,
+    useCriteriaMethod: p.policy.useCriteriaMethod,
+    usePercentMethod: p.policy.usePercentMethod,
+    allowFormativeInFinal: p.policy.allowFormativeInFinal,
+  };
+}
+
 type PgRow = { id: string; studentId: string; periodId: string; criteriaSum: number | null; criteriaCount: number | null; overallPct: number | null; grade7: number | null; grade5: number | null; gradeOverride7: number | null };
 type Calc = { criteriaSum: number | null; criteriaCount: number | null; overallPct: number | null; grade7: number | null; grade5: number | null };
 
@@ -43,6 +56,7 @@ const same = (a: PgRow | undefined, c: Calc) =>
  * Пересчитать итоги курса за все периоды (reporting → cumulative).
  * Всё считается в памяти за несколько запросов; в БД пишутся только изменившиеся строки.
  * Override и флаг публикации не трогаются.
+ * Возвращает число записанных строк и расшифровку процентной схемы по категориям.
  */
 export async function recalcCourse(db: Tx, courseId: string, onlyStudentIds?: string[]) {
   const course = await db.course.findUniqueOrThrow({
@@ -59,7 +73,7 @@ export async function recalcCourse(db: Tx, courseId: string, onlyStudentIds?: st
     orderBy: { sortOrder: "asc" },
   });
   const studentIds = course.enrollments.map((e) => e.studentId).filter((id) => !onlyStudentIds || onlyStudentIds.includes(id));
-  if (studentIds.length === 0) return { written: 0 };
+  if (studentIds.length === 0) return { written: 0, categoryPct: new Map<string, Record<string, number>>() };
 
   const [assignments, existingRaw] = await Promise.all([
     db.assignment.findMany({
@@ -69,7 +83,7 @@ export async function recalcCourse(db: Tx, courseId: string, onlyStudentIds?: st
         category: { select: { code: true } },
         criteria: { select: { criterionId: true } },
         evaluations: { where: { studentId: { in: studentIds } }, select: { studentId: true, status: true, score: true, criteria: { select: { criterionId: true, level: true } } } },
-        submissions: { where: { studentId: { in: studentIds }, status: "MISSED_INVALID" }, select: { studentId: true } },
+        submissions: { where: { studentId: { in: studentIds }, status: { in: ["MISSED_INVALID", "MISSED_VALID"] } }, select: { studentId: true, status: true } },
       },
       orderBy: { dueAt: "asc" },
     }),
@@ -81,54 +95,31 @@ export async function recalcCourse(db: Tx, courseId: string, onlyStudentIds?: st
   const existing = new Map(existingRaw.map((r) => [`${r.periodId}:${r.studentId}`, { ...r, overallPct: r.overallPct == null ? null : Number(r.overallPct) }]));
 
   // индексы для быстрого доступа
-  const evalIdx = new Map<string, (typeof assignments)[number]["evaluations"][number]>();
-  const missedIdx = new Set<string>();
+  const evalIdx = new Map<string, CalcEval>();
+  const missedIdx = new Map<string, Missed>();
   for (const a of assignments) {
-    for (const e of a.evaluations) evalIdx.set(`${a.id}:${e.studentId}`, e);
-    for (const m of a.submissions) missedIdx.add(`${a.id}:${m.studentId}`);
+    for (const e of a.evaluations) evalIdx.set(`${a.id}:${e.studentId}`, { status: e.status, score: e.score == null ? null : Number(e.score), levels: e.criteria });
+    for (const m of a.submissions) missedIdx.set(`${a.id}:${m.studentId}`, m.status === "MISSED_VALID" ? "VALID" : "INVALID");
   }
 
-  const computed: { periodId: string; studentId: string; calc: Calc; levels?: Map<string, number | null> }[] = [];
+  const computed: { periodId: string; studentId: string; calc: Calc; levels?: Map<string, number | null>; categoryPct?: Record<string, number> }[] = [];
   const effectiveGrade = new Map<string, number | null>();
+  const calcPolicy = calcPolicyOf({ policy, boundarySets, percentBands, fiveScale });
 
   for (const period of periods.filter((p) => p.kind === "REPORTING")) {
-    const weights: Record<string, number> = {};
-    for (const cw of period.categoryWeights.filter((w) => w.courseId === null || w.courseId === courseId)) {
-      if (cw.courseId === courseId || !(cw.category.code in weights)) weights[cw.category.code] = Number(cw.weight);
-    }
-    const pAssignments = assignments.filter((a) => a.periodId === period.id);
+    const ctx: TermContext = {
+      criteria: course.subject.criteria.map((c) => ({ id: c.id, code: c.code })),
+      assignments: assignments.filter((a) => a.periodId === period.id).map((a) => ({
+        id: a.id, type: a.type, maxScore: a.maxScore == null ? null : Number(a.maxScore), categoryCode: a.category?.code ?? null, criterionIds: a.criteria.map((c) => c.criterionId),
+      })),
+      policy: calcPolicy,
+      weights: weightsFor(period.categoryWeights, courseId),
+    };
     for (const studentId of studentIds) {
-      const buckets = new Map(course.subject.criteria.map((c) => [c.id, [] as number[]]));
-      const percentItems: { category: string; pct: number }[] = [];
-      for (const a of pAssignments) {
-        const ev = evalIdx.get(`${a.id}:${studentId}`);
-        const missedInvalid = missedIdx.has(`${a.id}:${studentId}`);
-        const counted = ev && (ev.status === "EVALUATED" || ev.status === "SHARED");
-        if (a.type === "SUMMATIVE" || policy.allowFormativeInFinal) {
-          for (const ac of a.criteria) {
-            const bucket = buckets.get(ac.criterionId);
-            if (!bucket) continue;
-            if (missedInvalid) bucket.push(0);
-            else if (counted) {
-              const lvl = ev!.criteria.find((x) => x.criterionId === ac.criterionId)?.level;
-              if (lvl != null) bucket.push(lvl);
-            }
-          }
-        }
-        if (a.maxScore && a.category) {
-          if (missedInvalid) percentItems.push({ category: a.category.code, pct: 0 });
-          else if (counted && ev!.score != null) percentItems.push({ category: a.category.code, pct: (Number(ev!.score) / Number(a.maxScore)) * 100 });
-        }
-      }
-      const r = computeTermGrade({
-        criteria: course.subject.criteria.map((c) => ({ code: c.code, levels: buckets.get(c.id)! })),
-        aggregation: policy.criterionAggregation as Aggregation,
-        boundarySets, percentItems, categoryWeights: weights, percentBands,
-        useCriteriaMethod: policy.useCriteriaMethod, usePercentMethod: policy.usePercentMethod,
-      });
+      const r = computeStudentTerm(ctx, (aid) => evalIdx.get(`${aid}:${studentId}`), (aid) => missedIdx.get(`${aid}:${studentId}`) ?? null);
       const levels = new Map(course.subject.criteria.map((c) => [c.id, r.criterionLevels[c.code] ?? null]));
       const calc: Calc = { criteriaSum: r.criteriaSum, criteriaCount: r.criteriaCount, overallPct: r.overallPct, grade7: r.grade7, grade5: toDependentScale(r.grade7, fiveScale) };
-      computed.push({ periodId: period.id, studentId, calc, levels });
+      computed.push({ periodId: period.id, studentId, calc, levels, categoryPct: r.categoryPct });
       const ov = existing.get(`${period.id}:${studentId}`)?.gradeOverride7;
       effectiveGrade.set(`${period.id}:${studentId}`, ov ?? r.grade7);
     }
@@ -173,7 +164,9 @@ export async function recalcCourse(db: Tx, courseId: string, onlyStudentIds?: st
     if ("$transaction" in db) await (db as PrismaClient).$transaction(ops);
     else for (const op of ops) await op;
   }
-  return { written: toCreate.length + cgCreate.length + ops.length };
+  // расшифровка процентной схемы по категориям: ключ «periodId:studentId» (в БД не хранится)
+  const categoryPct = new Map(computed.filter((c) => c.categoryPct).map((c) => [`${c.periodId}:${c.studentId}`, c.categoryPct!]));
+  return { written: toCreate.length + cgCreate.length + ops.length, categoryPct };
 }
 
 /** Пересчёт 5-балльной для override, использует шкалу программы. */

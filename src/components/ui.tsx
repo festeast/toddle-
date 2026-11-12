@@ -75,11 +75,11 @@ export function Notice({ children, tone = "blue" }: { children: ReactNode; tone?
   return <div className={`mb-4 rounded-lg border px-3 py-2 text-sm ${cls}`}>{children}</div>;
 }
 
-export function Tabs({ items }: { items: { href: string; label: ReactNode; active: boolean }[] }) {
+export function Tabs({ items }: { items: { href: string; label: ReactNode; active: boolean; title?: string }[] }) {
   return (
     <div className="mb-4 flex flex-wrap gap-1 border-b border-slate-200">
       {items.map((i) => (
-        <Link key={i.href} href={i.href} className={`-mb-px rounded-t-md border-b-2 px-3 py-1.5 text-sm font-medium ${i.active ? "border-brand-600 text-brand-700" : "border-transparent text-slate-500 hover:text-slate-800"}`}>
+        <Link key={i.href} href={i.href} title={i.title} aria-current={i.active ? "page" : undefined} className={`-mb-px rounded-t-md border-b-2 px-3 py-1.5 text-sm font-medium ${i.active ? "border-brand-600 text-brand-700" : "border-transparent text-slate-500 hover:text-slate-800"}`}>
           {i.label}
         </Link>
       ))}

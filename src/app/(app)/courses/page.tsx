@@ -18,7 +18,7 @@ export default async function CoursesPage() {
   const courses = allProgrammes || or.length
     ? await db.course.findMany({
         where: { deletedAt: null, archived: false, ...(allProgrammes ? {} : { OR: or }) },
-        include: { subject: true, programme: true, groups: { include: { group: true } }, staff: { include: { staff: { include: { user: true } } } }, _count: { select: { enrollments: true, assignments: true } } },
+        include: { subject: true, programme: true, groups: { include: { group: true } }, staff: { include: { staff: { include: { user: true } } } }, _count: { select: { enrollments: { where: { status: "ACTIVE" } }, assignments: { where: { deletedAt: null } } } } },
         orderBy: [{ programme: { code: "desc" } }, { name: "asc" }],
       })
     : [];

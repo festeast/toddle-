@@ -6,6 +6,7 @@ import { db } from "@/lib/db";
 import { canAdmin, hasRole } from "@/lib/access";
 import { logout } from "@/app/actions/session";
 import { LocaleSwitch } from "@/components/LocaleSwitch";
+import { NavLinks } from "@/components/NavLinks";
 import type { DictKey } from "@/lib/i18n-dict";
 import { config } from "@/lib/config";
 
@@ -35,16 +36,7 @@ export default async function AppLayout({ children }: { children: React.ReactNod
             <span className="grid h-7 w-7 place-items-center rounded-md bg-brand-600 text-xs font-bold text-white">IB</span>
             {t("appName")}
           </Link>
-          <nav className="flex flex-wrap gap-1 text-sm">
-            {nav.map((n) => {
-              const active = path === n.href || (n.href !== "/admin" && path.startsWith(n.href + "/"));
-              return (
-                <Link key={n.href} href={n.href} className={`rounded-md px-2.5 py-1.5 font-medium ${active ? "bg-brand-50 text-brand-700" : "text-slate-600 hover:bg-slate-100"}`}>
-                  {t(n.key)}
-                </Link>
-              );
-            })}
-          </nav>
+          <NavLinks items={nav.map((n) => ({ href: n.href, label: t(n.key) }))} />
           <div className="ml-auto flex items-center gap-3">
             <Link href="/notifications" className="relative rounded-md px-2 py-1.5 text-sm text-slate-600 hover:bg-slate-100" title={t("navNotifications")}>
               🔔{unread > 0 && <span className="absolute -right-1 -top-1 min-w-[1.1rem] rounded-full bg-red-600 px-1 text-center text-[10px] font-bold leading-[1.1rem] text-white">{unread > 99 ? "99+" : unread}</span>}

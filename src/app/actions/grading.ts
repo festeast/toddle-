@@ -1,85 +1,44 @@
 "use server";
-import { redirect } from "next/navigation";
+import { redirect, RedirectType } from "next/navigation";
+import { z } from "zod";
 import { db } from "@/lib/db";
 import { requireUser, fullName } from "@/lib/auth";
 import { canEditGrades, canManageCourse, isCoordinatorOf, isSchoolAdmin } from "@/lib/access";
 import { recalcCourse, fiveFor } from "@/lib/grading/service";
-import type { SubmissionStatus } from "@prisma/client";
+import { applyCellPatch, notifyFamilies, setAssignmentShared, SUB_STATUSES } from "@/lib/grading/gradebook";
+import type { SaveError, SaveResult } from "@/lib/grading/types";
 import { clip, isUuid } from "@/lib/validate";
 
-const SUB_STATUSES: SubmissionStatus[] = ["NOT_SUBMITTED", "SUBMITTED", "LATE", "RETURNED", "MISSED_VALID", "MISSED_INVALID"];
+const SaveCellSchema = z.object({
+  assignmentId: z.string().uuid(),
+  studentId: z.string().uuid(),
+  patch: z.object({
+    score: z.number().finite().nullable().optional(),
+    levels: z.record(z.string().uuid(), z.number().int().nullable()).optional(),
+    sub: z.enum(SUB_STATUSES as [string, ...string[]]).optional(),
+    comment: z.string().max(5000).optional(),
+  }).strict(),
+});
 
-export async function saveEvaluations(formData: FormData) {
+/**
+ * Сохранить одну ячейку журнала (оценка, уровни критериев, статус сдачи или комментарий).
+ * Вызывается из браузера при каждом изменении; возвращает сохранённую ячейку и пересчитанный итог ученика.
+ * Ошибки проверки возвращаются значением, а не исключением, чтобы учитель видел подсказку прямо в журнале.
+ */
+export async function saveCell(input: unknown): Promise<SaveResult> {
   const user = await requireUser();
-  const assignmentId = String(formData.get("assignmentId"));
-  if (!isUuid(assignmentId)) throw new Error("bad id");
-  const publish = formData.get("publish") != null;
-  const a = await db.assignment.findUniqueOrThrow({
-    where: { id: assignmentId },
-    include: { criteria: true, course: { include: { enrollments: { where: { status: "ACTIVE" } } } } },
-  });
-  if (!(await canEditGrades(user, a.courseId, a.periodId))) throw new Error("forbidden: period locked or not your course");
-
-  const notifyStudents: string[] = [];
-  for (const e of a.course.enrollments) {
-    const sid = e.studentId;
-    const subRaw = String(formData.get(`sub_${sid}`) ?? "");
-    const subStatus = SUB_STATUSES.includes(subRaw as SubmissionStatus) ? (subRaw as SubmissionStatus) : null;
-    if (subStatus) {
-      await db.submission.upsert({
-        where: { assignmentId_studentId: { assignmentId, studentId: sid } },
-        create: { assignmentId, studentId: sid, status: subStatus, submittedAt: subStatus === "SUBMITTED" || subStatus === "LATE" ? new Date() : null, makeupUntil: subStatus === "MISSED_VALID" ? new Date(Date.now() + 7 * 86400000) : null },
-        update: { status: subStatus, makeupUntil: subStatus === "MISSED_VALID" ? new Date(Date.now() + 7 * 86400000) : null },
-      });
-    }
-    const levels = a.criteria.map((c) => {
-      const raw = String(formData.get(`lvl_${sid}_${c.criterionId}`) ?? "").trim();
-      if (raw === "") return { criterionId: c.criterionId, level: null as number | null };
-      const n = Number(raw);
-      if (!Number.isInteger(n) || n < 0 || n > c.maxLevel) throw new Error(`Уровень должен быть 0–${c.maxLevel}`);
-      return { criterionId: c.criterionId, level: n };
-    });
-    const scoreRaw = String(formData.get(`score_${sid}`) ?? "").trim();
-    let score: number | null = null;
-    if (scoreRaw !== "" && a.maxScore) {
-      score = Number(scoreRaw.replace(",", "."));
-      if (!Number.isFinite(score) || score < 0 || score > Number(a.maxScore)) throw new Error(`Балл должен быть 0–${a.maxScore}`);
-    }
-    const comment = clip(formData.get(`comment_${sid}`), 2000);
-    const hasData = levels.some((l) => l.level != null) || score != null;
-    const existing = await db.evaluation.findUnique({ where: { assignmentId_studentId: { assignmentId, studentId: sid } } });
-    if (!hasData && !existing && !comment) continue;
-    const status = !hasData ? (existing?.status ?? "NOT_EVALUATED") : publish ? "SHARED" : existing?.status === "SHARED" ? "SHARED" : "EVALUATED";
-    const ev = await db.evaluation.upsert({
-      where: { assignmentId_studentId: { assignmentId, studentId: sid } },
-      create: { assignmentId, studentId: sid, status, score, comment: comment ? { text: comment } : undefined, evaluatedById: user.id, evaluatedAt: new Date(), sharedAt: status === "SHARED" ? new Date() : null },
-      update: { status, score, comment: comment ? { text: comment } : undefined, evaluatedById: user.id, evaluatedAt: new Date(), sharedAt: status === "SHARED" && existing?.status !== "SHARED" ? new Date() : existing?.sharedAt },
-    });
-    for (const l of levels) {
-      if (l.level == null) {
-        await db.criterionEvaluation.deleteMany({ where: { evaluationId: ev.id, criterionId: l.criterionId } });
-      } else {
-        await db.criterionEvaluation.upsert({
-          where: { evaluationId_criterionId: { evaluationId: ev.id, criterionId: l.criterionId } },
-          create: { evaluationId: ev.id, criterionId: l.criterionId, level: l.level },
-          update: { level: l.level },
-        });
-      }
-    }
-    if (status === "SHARED" && existing?.status !== "SHARED") notifyStudents.push(sid);
-  }
-  if (notifyStudents.length) await notifyFamilies(notifyStudents, "GRADE_PUBLISHED", `Опубликована оценка: ${a.title}`, "Assignment", a.id);
-  await recalcCourse(db, a.courseId);
-  redirect(`/assignments/${assignmentId}?saved=1`);
+  const parsed = SaveCellSchema.safeParse(input);
+  if (!parsed.success) return { ok: false, error: "invalid" };
+  const { assignmentId, studentId, patch } = parsed.data;
+  return applyCellPatch(user, assignmentId, studentId, patch as Parameters<typeof applyCellPatch>[3]);
 }
 
-async function notifyFamilies(studentIds: string[], trigger: string, title: string, entityType: string, entityId: string) {
-  const students = await db.studentProfile.findMany({ where: { id: { in: studentIds } }, include: { guardians: { where: { approved: true }, include: { guardian: true } } } });
-  const data = students.flatMap((s) => [
-    { recipientId: s.userId, trigger, title, entityType, entityId },
-    ...s.guardians.map((g) => ({ recipientId: g.guardian.userId, trigger, title, entityType, entityId })),
-  ]);
-  if (data.length) await db.notification.createMany({ data });
+/** Опубликовать оценки задания ученикам и родителям или скрыть их обратно. */
+export async function setAssignmentPublished(assignmentId: unknown, publish: unknown): Promise<{ ok: true; count: number } | { ok: false; error: SaveError }> {
+  const user = await requireUser();
+  if (!isUuid(assignmentId) || typeof publish !== "boolean") return { ok: false, error: "invalid" };
+  const res = await setAssignmentShared(user, assignmentId, publish);
+  return res ? { ok: true, count: res.count } : { ok: false, error: "forbidden" };
 }
 
 export async function recalcAction(formData: FormData) {
@@ -88,7 +47,7 @@ export async function recalcAction(formData: FormData) {
   if (!isUuid(courseId) || !(await canManageCourse(user, courseId))) throw new Error("forbidden");
   await recalcCourse(db, courseId);
   const period = String(formData.get("period") ?? "").replace(/[^A-Z0-9]/g, "").slice(0, 4);
-  redirect(`/courses/${courseId}?period=${period}&recalc=1`);
+  redirect(`/courses/${courseId}?period=${period}&recalc=1`, RedirectType.replace);
 }
 
 export async function publishPeriod(formData: FormData) {
@@ -106,7 +65,7 @@ export async function publishPeriod(formData: FormData) {
     await notifyFamilies(pgs.map((p) => p.studentId), "PERIOD_PUBLISHED", `Итоги ${period.name}: ${course.name}`, "Course", courseId);
   }
   await db.auditLog.create({ data: { schoolId: course.schoolId, actorId: user.id, action: publish ? "PERIOD_PUBLISH" : "PERIOD_UNPUBLISH", entityType: "Course", entityId: courseId, meta: { period: period.abbreviation, course: course.name } } });
-  redirect(`/courses/${courseId}?period=${period.abbreviation}`);
+  redirect(`/courses/${courseId}?period=${period.abbreviation}`, RedirectType.replace);
 }
 
 export async function overrideGrade(formData: FormData) {

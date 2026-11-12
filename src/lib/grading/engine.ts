@@ -66,25 +66,39 @@ export function percentToGrade(pct: number, bands: PercentBand[]): number | null
 }
 
 /**
+ * Средний процент внутри каждой категории (среднее процентов работ, как в Toddle).
+ * Категории без веса или с весом ≤ 0 не учитываются. Значения не округляются.
+ */
+export function categoryAverages(
+  items: { category: string; pct: number }[],
+  weights: Record<string, number>,
+): Record<string, number> {
+  const byCat = new Map<string, number[]>();
+  for (const it of items) {
+    if (!(it.category in weights) || weights[it.category] <= 0) continue;
+    byCat.set(it.category, [...(byCat.get(it.category) ?? []), it.pct]);
+  }
+  const out: Record<string, number> = {};
+  for (const [cat, list] of byCat) out[cat] = list.reduce((a, b) => a + b, 0) / list.length;
+  return out;
+}
+
+/**
  * Взвешенный процент по категориям (Formative 25 / Summative 75).
  * Внутри категории — среднее процентов работ. Пустые категории исключаются, веса перенормируются.
+ * Итог считается от процентов категорий, округлённых до сотых, — так же, как в Toddle, и так, как видит
+ * учитель в журнале: 25 % × 32,85 + 75 % × 31,67 = 31,97 (а не 31,96 от неокруглённых значений).
  */
 export function weightedCategoryPercent(
   items: { category: string; pct: number }[],
   weights: Record<string, number>,
 ): number | null {
-  const byCat = new Map<string, number[]>();
-  for (const it of items) {
-    if (!(it.category in weights)) continue;
-    byCat.set(it.category, [...(byCat.get(it.category) ?? []), it.pct]);
-  }
+  const avg = categoryAverages(items, weights);
   let sumW = 0;
   let acc = 0;
-  for (const [cat, list] of byCat) {
-    const w = weights[cat];
-    if (w <= 0) continue;
-    acc += w * (list.reduce((a, b) => a + b, 0) / list.length);
-    sumW += w;
+  for (const [cat, mean] of Object.entries(avg)) {
+    acc += weights[cat] * roundHalfUp(mean, 2);
+    sumW += weights[cat];
   }
   return sumW === 0 ? null : roundHalfUp(acc / sumW, 2);
 }
@@ -128,6 +142,8 @@ export type TermResult = {
   criteriaSum: number | null;
   criteriaCount: number;
   overallPct: number | null;
+  /** средний процент по каждой категории с данными (округлён до 2 знаков) — расшифровка overallPct */
+  categoryPct: Record<string, number>;
   grade7: number | null;
   method: "CRITERIA" | "PERCENT" | null;
 };
@@ -145,10 +161,12 @@ export function computeTermGrade(input: TermInput): TermResult {
       count += 1;
     }
   }
-  const overallPct =
-    input.usePercentMethod !== false && input.percentItems && input.categoryWeights
-      ? weightedCategoryPercent(input.percentItems, input.categoryWeights)
-      : null;
+  const percentOn = input.usePercentMethod !== false && !!input.percentItems && !!input.categoryWeights;
+  const overallPct = percentOn ? weightedCategoryPercent(input.percentItems!, input.categoryWeights!) : null;
+  const categoryPct: Record<string, number> = {};
+  if (percentOn) {
+    for (const [cat, mean] of Object.entries(categoryAverages(input.percentItems!, input.categoryWeights!))) categoryPct[cat] = roundHalfUp(mean, 2);
+  }
 
   let grade7: number | null = null;
   let method: TermResult["method"] = null;
@@ -160,7 +178,7 @@ export function computeTermGrade(input: TermInput): TermResult {
     grade7 = percentToGrade(overallPct, input.percentBands);
     method = grade7 == null ? null : "PERCENT";
   }
-  return { criterionLevels, criteriaSum: count ? sum : null, criteriaCount: count, overallPct, grade7, method };
+  return { criterionLevels, criteriaSum: count ? sum : null, criteriaCount: count, overallPct, categoryPct, grade7, method };
 }
 
 /** Действующая оценка: ручное переопределение важнее расчёта. */

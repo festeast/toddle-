@@ -5,12 +5,12 @@ import { requireUser } from "@/lib/auth";
 import { getT } from "@/lib/i18n";
 import { db } from "@/lib/db";
 import { canManageCourse, canEditGrades } from "@/lib/access";
-import { PageTitle, Card, Badge, Notice } from "@/components/ui";
-import { saveEvaluations } from "@/app/actions/grading";
+import { PageTitle, Badge, Notice } from "@/components/ui";
+import { AssignmentGrid } from "@/components/gradebook/AssignmentGrid";
+import { toCell } from "@/lib/grading/gradebook";
+import type { Cell, GbColumn } from "@/lib/grading/types";
 import { fmtDate, dateToIso } from "@/lib/dates";
 import { summativeLoad } from "@/lib/workload";
-
-const SUBS = ["SUBMITTED", "LATE", "NOT_SUBMITTED", "MISSED_VALID", "MISSED_INVALID"] as const;
 
 export default async function AssignmentPage({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ saved?: string; created?: string }> }) {
   const id = uuidOr404((await params).id);
@@ -29,85 +29,64 @@ export default async function AssignmentPage({ params, searchParams }: { params:
   if (!a || a.deletedAt) notFound();
   if (!(await canManageCourse(user, a.courseId))) return <Notice tone="red">{t("accessDenied")}</Notice>;
   const canEdit = await canEditGrades(user, a.courseId, a.periodId);
-  const students = a.course.enrollments.map((e) => e.student).sort((x, y) => x.user.lastName.localeCompare(y.user.lastName, "ru"));
+  const students = a.course.enrollments.map((e) => e.student).sort((x, y) => x.user.lastName.localeCompare(y.user.lastName, "ru") || x.user.firstName.localeCompare(y.user.firstName, "ru"));
   const load = a.type === "SUMMATIVE" && a.dueAt ? await summativeLoad(a.courseId, dateToIso(a.dueAt)) : 0;
-  const shared = a.evaluations.filter((e) => e.status === "SHARED").length;
-  const evaluated = a.evaluations.filter((e) => e.status === "EVALUATED" || e.status === "SHARED").length;
+  const policy = await db.gradingPolicy.findFirst({ where: { programmeId: a.course.programmeId }, select: { maxSummativePerDay: true, allowFormativeInFinal: true } });
+
+  const critIds = a.criteria.map((c) => c.criterionId);
+  const evs = new Map(a.evaluations.map((e) => [e.studentId, e]));
+  const subs = new Map(a.submissions.map((s) => [s.studentId, s]));
+  const cells: Record<string, Cell> = {};
+  for (const s of students) {
+    const ev = evs.get(s.id);
+    const sub = subs.get(s.id);
+    if (ev || sub) cells[s.id] = toCell(critIds, ev, sub);
+  }
+  const column: GbColumn = {
+    id: a.id, title: a.title, type: a.type === "FORMATIVE" ? "FORMATIVE" : "SUMMATIVE",
+    due: fmtDate(a.dueAt, locale), dueIso: a.dueAt ? dateToIso(a.dueAt) : null,
+    maxScore: a.maxScore == null ? null : Number(a.maxScore), categoryCode: a.category?.code ?? null,
+    criteria: a.criteria.map((c) => ({ id: c.criterionId, code: c.criterion.code, name: tj(c.criterion.name), maxLevel: c.maxLevel })),
+    countsForCriteria: a.type === "SUMMATIVE" || !!policy?.allowFormativeInFinal,
+  };
+  const instructions = tj(a.instructions);
+  const gradebookHref = `/courses/${a.courseId}?period=${a.period?.abbreviation ?? ""}`;
 
   return (
     <>
       <PageTitle
-        back={{ href: `/courses/${a.courseId}?period=${a.period?.abbreviation ?? ""}`, label: a.course.name }}
+        back={{ href: gradebookHref, label: `${a.course.name} · ${t("gradebook").toLowerCase()}` }}
         title={a.title}
         subtitle={<span className="flex flex-wrap items-center gap-2">
-          <Badge tone={a.type === "SUMMATIVE" ? "violet" : "slate"}>{t(`type_${a.type}` as never)}</Badge>
+          <Badge tone={a.type === "SUMMATIVE" ? "violet" : "blue"}>{t(`type_${a.type}` as never)}</Badge>
           <span>{t("dueDate")}: {fmtDate(a.dueAt, locale, { day: "numeric", month: "long" })}</span>
-          <span>· {a.period?.name}</span>
-          <span>· {evaluated}/{students.length} {t("evaluated")}, {shared} {t("published").toLowerCase()}</span>
+          {a.period && <span>· {a.period.name}{a.period.locked ? " 🔒" : ""}</span>}
+          {a.maxScore != null && <span>· {t("maxScore")}: {Number(a.maxScore)}</span>}
           {a.hideTotalFromStudents && <Badge>{t("hiddenTotal")}</Badge>}
         </span>}
+        actions={canEdit ? <Link className="btn" href={`/assignments/${a.id}/edit`}>{t("edit")}</Link> : null}
       />
+      {sp.created && <Notice tone="green">✓ {t("assignmentCreated")}</Notice>}
       {sp.saved && <Notice tone="green">✓ {t("saved")}</Notice>}
-      {load > 3 && <Notice tone="amber">⚠ {t("summativeLimitWarn")} ({load})</Notice>}
+      {load > (policy?.maxSummativePerDay ?? 3) && <Notice tone="amber">⚠ {t("summativeLimitWarn")} ({load})</Notice>}
       {!canEdit && <Notice tone="amber">🔒 {t("periodLockedMsg")}</Notice>}
+      {column.criteria.length === 0 && column.maxScore == null && <Notice tone="amber">⚠ {t("noScale")}</Notice>}
 
-      {a.criteria.length > 0 && (
-        <div className="mb-4 flex flex-wrap gap-2 text-sm">
-          {a.criteria.map((c) => <span key={c.criterionId} className="rounded-lg bg-white px-3 py-1.5 shadow-sm ring-1 ring-slate-200"><b>{c.criterion.code}</b> {tj(c.criterion.name)} <span className="text-slate-400">0–{c.maxLevel}</span></span>)}
+      {(instructions || a.criteria.length > 0) && (
+        <div className="mb-4 space-y-3">
+          {instructions && <div className="card whitespace-pre-line px-4 py-3 text-sm text-slate-700"><div className="label">{t("description")}</div>{instructions}</div>}
+          {a.criteria.length > 0 && (
+            <div className="flex flex-wrap gap-2 text-sm">
+              {a.criteria.map((c) => <span key={c.criterionId} className="rounded-lg bg-white px-3 py-1.5 shadow-sm ring-1 ring-slate-200"><b>{c.criterion.code}</b> {tj(c.criterion.name)} <span className="text-slate-400">0–{c.maxLevel}</span></span>)}
+            </div>
+          )}
         </div>
       )}
 
-      <form action={saveEvaluations}>
-        <input type="hidden" name="assignmentId" value={a.id} />
-        <Card>
-          <div className="overflow-x-auto">
-            <table className="tbl">
-              <thead>
-                <tr>
-                  <th>{t("student")}</th>
-                  <th>{t("status")}</th>
-                  {a.criteria.map((c) => <th key={c.criterionId} className="text-center">{c.criterion.code}</th>)}
-                  {a.maxScore && <th className="text-center">{t("score")} /{Number(a.maxScore)}</th>}
-                  <th>{t("feedback")}</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody>
-                {students.map((s) => {
-                  const ev = a.evaluations.find((e) => e.studentId === s.id);
-                  const sub = a.submissions.find((x) => x.studentId === s.id);
-                  const comment = ev?.comment && typeof ev.comment === "object" ? (ev.comment as { text?: string }).text ?? "" : "";
-                  return (
-                    <tr key={s.id}>
-                      <td className="whitespace-nowrap font-medium"><Link href={`/students/${s.id}`} className="hover:underline">{s.user.lastName} {s.user.firstName}</Link></td>
-                      <td>
-                        <select name={`sub_${s.id}`} defaultValue={sub?.status ?? "NOT_SUBMITTED"} disabled={!canEdit} className="input py-1 text-xs">
-                          {SUBS.map((st) => <option key={st} value={st}>{t(`sub_${st}` as never)}</option>)}
-                        </select>
-                      </td>
-                      {a.criteria.map((c) => (
-                        <td key={c.criterionId} className="text-center">
-                          <input type="number" min={0} max={c.maxLevel} step={1} name={`lvl_${s.id}_${c.criterionId}`} disabled={!canEdit}
-                            defaultValue={ev?.criteria.find((x) => x.criterionId === c.criterionId)?.level ?? ""} className="input w-14 py-1 text-center tabular-nums" />
-                        </td>
-                      ))}
-                      {a.maxScore && <td className="text-center"><input type="number" min={0} max={Number(a.maxScore)} step="0.5" name={`score_${s.id}`} disabled={!canEdit} defaultValue={ev?.score != null ? Number(ev.score) : ""} className="input w-20 py-1 text-center tabular-nums" /></td>}
-                      <td><input name={`comment_${s.id}`} defaultValue={comment} disabled={!canEdit} className="input w-full min-w-[14rem] py-1" /></td>
-                      <td>{ev && ev.status !== "NOT_EVALUATED" && <Badge tone={ev.status === "SHARED" ? "green" : "amber"}>{t(`ev_${ev.status}` as never)}</Badge>}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-          {canEdit && (
-            <div className="mt-4 flex flex-wrap justify-end gap-2">
-              <button className="btn">{t("saveGrades")}</button>
-              <button name="publish" value="1" className="btn btn-primary">{t("publishGrades")}</button>
-            </div>
-          )}
-        </Card>
-      </form>
+      <AssignmentGrid
+        version={Date.now()} locale={locale} canEdit={canEdit} assignment={column} cells={cells}
+        students={students.map((s) => ({ id: s.id, name: `${s.user.lastName} ${s.user.firstName}` }))}
+      />
     </>
   );
 }

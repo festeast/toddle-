@@ -32,3 +32,12 @@ COPY --from=build --chown=nonroot:nonroot /app/.next/static ./.next/static
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD ["/nodejs/bin/node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
 CMD ["server.js"]
+
+# Railway собирает ПОСЛЕДНЮЮ стадию Dockerfile. Она сама применяет миграции при каждом старте
+# (и заполняет демо-данными пустую базу при SEED_DEMO=true). docker-compose.prod.yml берёт
+# стадии runner/tools явно, поэтому эта стадия на него не влияет.
+FROM gcr.io/distroless/nodejs22-debian12:nonroot AS railway
+WORKDIR /app
+ENV NODE_ENV=production HOSTNAME=0.0.0.0 NEXT_TELEMETRY_DISABLED=1
+COPY --from=build --chown=nonroot:nonroot /app /app
+CMD ["scripts/railway-start.cjs"]

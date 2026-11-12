@@ -56,10 +56,10 @@ export default async function OverridePage({ params }: { params: Promise<{ id: s
                   ))}
                 </div>
               </div>
-              <div><label className="label">{t("reason")}</label><input name="reason" className="input w-full" placeholder="Решение педсовета, пересдача…" /></div>
+              <div><label className="label" htmlFor="ov-reason">{t("reason")}</label><input id="ov-reason" name="reason" required maxLength={500} className="input w-full" placeholder="Решение педсовета, пересдача…" /></div>
               <div className="flex flex-wrap gap-2">
                 <button className="btn btn-primary">{t("save")}</button>
-                {pg.gradeOverride7 != null && <button name="clear" value="1" className="btn">{t("clearOverride")}</button>}
+                {pg.gradeOverride7 != null && <button name="clear" value="1" formNoValidate className="btn">{t("clearOverride")}</button>}
               </div>
             </form>
           ) : <div className="text-sm text-slate-500">{t("periodLockedMsg")}</div>}
